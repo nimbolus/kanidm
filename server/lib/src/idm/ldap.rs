@@ -8,6 +8,7 @@ use std::str::FromStr;
 use compact_jwt::JwsCompact;
 use kanidm_proto::constants::*;
 use kanidm_proto::internal::{ApiToken, UserAuthToken};
+use ldap3_proto::proto::{LdapOp, LdapResult};
 use ldap3_proto::simple::*;
 use regex::Regex;
 use std::net::IpAddr;
@@ -477,6 +478,143 @@ impl LdapServer {
         Ok(result)
     }
 
+    #[instrument(level = "debug", skip_all)]
+    async fn do_compare(
+        &self,
+        _idms: &IdmServer,
+        cr: &CompareRequest,
+        uat: &LdapBoundToken,
+        _source: Source,
+    ) -> Result<Vec<LdapMsg>, OperationError> {
+        admin_info!("Attempt LDAP CompareRequest for {}", uat.spn);
+
+        // convert to a search request, and then do the search.
+        let sr = SearchRequest {
+            msgid: cr.msgid,
+            base: cr.entry.clone(),
+            scope: LdapSearchScope::Base,
+            filter: LdapFilter::Equality(cr.atype.clone(), cr.val.clone()),
+            attrs: vec!["1.1".to_string()],
+        };
+
+        admin_debug!("Converting to Search: {:?}", sr);
+
+        let res = match self.do_search(_idms, &sr, uat, Source::Internal).await {
+            Ok(r) => r,
+            Err(OperationError::InvalidRequestState) => {
+                return Ok(vec![LdapMsg {
+                    msgid: cr.msgid,
+                    op: LdapOp::CompareResult(LdapResult {
+                        code: LdapResultCode::InvalidDNSyntax,
+                        matcheddn: "".to_string(),
+                        message: "".to_string(),
+                        referral: vec![],
+                    }),
+                    ctrl: vec![],
+                }]);
+            }
+            Err(OperationError::InvalidAttributeName(s)) => {
+                return Ok(vec![LdapMsg {
+                    msgid: cr.msgid,
+                    op: LdapOp::CompareResult(LdapResult {
+                        code: LdapResultCode::UndefinedAttributeType,
+                        matcheddn: "".to_string(),
+                        message: s,
+                        referral: vec![],
+                    }),
+                    ctrl: vec![],
+                }]);
+            }
+            Err(e) => {
+                return Err(e);
+            }
+        };
+
+        dbg!(&res);
+
+        match res.len() {
+            2 => match res[1].op {
+                LdapOp::SearchResultDone(ref srd) => match srd.code {
+                    LdapResultCode::Success => {
+                        return Ok(vec![LdapMsg {
+                            msgid: cr.msgid,
+                            op: LdapOp::CompareResult(LdapResult {
+                                code: LdapResultCode::CompareTrue,
+                                matcheddn: "".to_string(),
+                                message: "".to_string(),
+                                referral: vec![],
+                            }),
+                            ctrl: vec![],
+                        }]);
+                    }
+                    _ => {}
+                },
+                _ => {}
+            },
+            1 => match res[0].op {
+                LdapOp::SearchResultDone(ref srd) => match srd.code {
+                    LdapResultCode::Success => {
+                        // search again to determine if entry exists at all
+                        let sr2 = SearchRequest {
+                            msgid: cr.msgid,
+                            base: cr.entry.clone(),
+                            scope: LdapSearchScope::Base,
+                            filter: LdapFilter::Present(cr.atype.clone()),
+                            attrs: vec!["1.1".to_string()],
+                        };
+
+                        let res2 = self.do_search(_idms, &sr2, uat, Source::Internal).await?;
+
+                        match res2.len() {
+                            2 => match res2[1].op {
+                                LdapOp::SearchResultDone(ref srd) => match srd.code {
+                                    LdapResultCode::Success => {
+                                        return Ok(vec![LdapMsg {
+                                            msgid: cr.msgid,
+                                            op: LdapOp::CompareResult(LdapResult {
+                                                code: LdapResultCode::CompareFalse,
+                                                matcheddn: "".to_string(),
+                                                message: "".to_string(),
+                                                referral: vec![],
+                                            }),
+                                            ctrl: vec![],
+                                        }]);
+                                    }
+                                    _ => {}
+                                },
+                                _ => {}
+                            },
+                            1 => match res2[0].op {
+                                LdapOp::SearchResultDone(ref srd) => match srd.code {
+                                    LdapResultCode::Success => {
+                                        return Ok(vec![LdapMsg {
+                                            msgid: cr.msgid,
+                                            op: LdapOp::CompareResult(LdapResult {
+                                                code: LdapResultCode::NoSuchObject,
+                                                matcheddn: "".to_string(),
+                                                message: "".to_string(),
+                                                referral: vec![],
+                                            }),
+                                            ctrl: vec![],
+                                        }]);
+                                    }
+                                    _ => {}
+                                },
+                                _ => {}
+                            },
+                            _ => {}
+                        }
+                    }
+                    _ => {}
+                },
+                _ => {}
+            },
+            _ => {}
+        }
+
+        Err(OperationError::InvalidRequestState)
+    }
+
     pub async fn do_op(
         &self,
         idms: &IdmServer,
@@ -536,9 +674,39 @@ impl LdapServer {
                 // No need to notify on unbind (per rfc4511)
                 Ok(LdapResponseState::Unbind)
             }
-            ServerOps::Compare(cr) => Ok(LdapResponseState::Respond(
-                cr.gen_error(LdapResultCode::Other, "not supported".to_string()),
-            )),
+            ServerOps::Compare(cr) => match uat {
+                Some(u) => self
+                    .do_compare(idms, &cr, &u, source)
+                    .await
+                    .map(LdapResponseState::MultiPartResponse)
+                    .or_else(|e| {
+                        let (rc, msg) = operationerr_to_ldapresultcode(e);
+                        Ok(LdapResponseState::Respond(cr.gen_error(rc, msg)))
+                    }),
+                None => {
+                    // Compare can occur without a bind, so bind first.
+                    let lbt = match self.do_bind(idms, "", "").await {
+                        Ok(Some(lbt)) => lbt,
+                        Ok(None) => {
+                            return Ok(LdapResponseState::Respond(
+                                cr.gen_error(LdapResultCode::InvalidCredentials, "".to_string()),
+                            ))
+                        }
+                        Err(e) => {
+                            let (rc, msg) = operationerr_to_ldapresultcode(e);
+                            return Ok(LdapResponseState::Respond(cr.gen_error(rc, msg)));
+                        }
+                    };
+                    // If okay, do the compare.
+                    self.do_compare(idms, &cr, &lbt, Source::Internal)
+                        .await
+                        .map(|r| LdapResponseState::BindMultiPartResponse(lbt, r))
+                        .or_else(|e| {
+                            let (rc, msg) = operationerr_to_ldapresultcode(e);
+                            Ok(LdapResponseState::Respond(cr.gen_error(rc, msg)))
+                        })
+                }
+            },
             ServerOps::Whoami(wr) => match uat {
                 Some(u) => Ok(LdapResponseState::Respond(
                     wr.gen_success(format!("u: {}", u.spn).as_str()),
@@ -645,7 +813,9 @@ mod tests {
     use compact_jwt::{dangernoverify::JwsDangerReleaseWithoutVerify, JwsVerifier};
     use hashbrown::HashSet;
     use kanidm_proto::internal::ApiToken;
-    use ldap3_proto::proto::{LdapFilter, LdapOp, LdapSearchScope, LdapSubstringFilter};
+    use ldap3_proto::proto::{
+        LdapFilter, LdapOp, LdapResultCode, LdapSearchScope, LdapSubstringFilter,
+    };
     use ldap3_proto::simple::*;
 
     use super::{LdapServer, LdapSession};
@@ -1568,6 +1738,143 @@ mod tests {
                         "cc8e95b4-c24f-4d68-ba54-8bed76f63930"
                     )
                 );
+            }
+            _ => assert!(false),
+        };
+    }
+
+    #[idm_test]
+    async fn test_ldap_compare_request(idms: &IdmServer, _idms_delayed: &IdmServerDelayed) {
+        let ldaps = LdapServer::new(idms).await.expect("failed to start ldap");
+
+        let acct_uuid = uuid!("cc8e95b4-c24f-4d68-ba54-8bed76f63930");
+
+        // Setup a user we want to check.
+        {
+            let e1 = entry_init!(
+                (Attribute::Class, EntryClass::Person.to_value()),
+                (Attribute::Class, EntryClass::Account.to_value()),
+                (Attribute::Class, EntryClass::PosixAccount.to_value()),
+                (Attribute::Name, Value::new_iname("testperson1")),
+                (Attribute::Uuid, Value::Uuid(acct_uuid)),
+                (Attribute::GidNumber, Value::Uint32(12345)),
+                (Attribute::Description, Value::new_utf8s("testperson1")),
+                (Attribute::DisplayName, Value::new_utf8s("testperson1"))
+            );
+
+            let mut server_txn = idms.proxy_write(duration_from_epoch_now()).await;
+            assert!(server_txn
+                .qs_write
+                .internal_create(vec![e1])
+                .and_then(|_| server_txn.commit())
+                .is_ok());
+        }
+
+        // Setup the anonymous login.
+        let anon_t = ldaps.do_bind(idms, "", "").await.unwrap().unwrap();
+        assert!(anon_t.effective_session == LdapSession::UnixBind(UUID_ANONYMOUS));
+
+        let cr = CompareRequest {
+            msgid: 1,
+            entry: "name=testperson1,dc=example,dc=com".to_string(),
+            atype: Attribute::Name.to_string(),
+            val: "testperson1".to_string(),
+        };
+        let r1 = ldaps
+            .do_compare(idms, &cr, &anon_t, Source::Internal)
+            .await
+            .unwrap();
+
+        dbg!(&r1);
+
+        assert!(r1.len() == 1);
+        match &r1[0].op {
+            LdapOp::CompareResult(lcr) => {
+                assert_eq!(lcr.code, LdapResultCode::CompareTrue);
+            }
+            _ => assert!(false),
+        };
+
+        let cr = CompareRequest {
+            msgid: 1,
+            entry: "name=testperson1,dc=example,dc=com".to_string(),
+            atype: Attribute::Name.to_string(),
+            val: "other".to_string(),
+        };
+        let r2 = ldaps
+            .do_compare(idms, &cr, &anon_t, Source::Internal)
+            .await
+            .unwrap();
+
+        dbg!(&r2);
+
+        assert!(r2.len() == 1);
+        match &r2[0].op {
+            LdapOp::CompareResult(lcr) => {
+                assert_eq!(lcr.code, LdapResultCode::CompareFalse);
+            }
+            _ => assert!(false),
+        };
+
+        let cr = CompareRequest {
+            msgid: 1,
+            entry: "name=other,dc=example,dc=com".to_string(),
+            atype: Attribute::Name.to_string(),
+            val: "other".to_string(),
+        };
+        let r3 = ldaps
+            .do_compare(idms, &cr, &anon_t, Source::Internal)
+            .await
+            .unwrap();
+
+        dbg!(&r3);
+
+        assert!(r3.len() == 1);
+        match &r3[0].op {
+            LdapOp::CompareResult(lcr) => {
+                assert_eq!(lcr.code, LdapResultCode::NoSuchObject);
+            }
+            _ => assert!(false),
+        };
+
+        let cr = CompareRequest {
+            msgid: 1,
+            entry: "invalidentry".to_string(),
+            atype: Attribute::Name.to_string(),
+            val: "other".to_string(),
+        };
+        let r4 = ldaps
+            .do_compare(idms, &cr, &anon_t, Source::Internal)
+            .await
+            .unwrap();
+
+        dbg!(&r4);
+
+        assert!(r4.len() == 1);
+        match &r4[0].op {
+            LdapOp::CompareResult(lcr) => {
+                assert_eq!(lcr.code, LdapResultCode::InvalidDNSyntax);
+            }
+            _ => assert!(false),
+        };
+
+        let cr = CompareRequest {
+            msgid: 1,
+            entry: "name=other,dc=example,dc=com".to_string(),
+            atype: "invalid".to_string(),
+            val: "other".to_string(),
+        };
+        let r5 = ldaps
+            .do_compare(idms, &cr, &anon_t, Source::Internal)
+            .await
+            .unwrap();
+
+        dbg!(&r5);
+
+        assert!(r5.len() == 1);
+        match &r5[0].op {
+            LdapOp::CompareResult(lcr) => {
+                assert_eq!(lcr.code, LdapResultCode::UndefinedAttributeType);
             }
             _ => assert!(false),
         };
